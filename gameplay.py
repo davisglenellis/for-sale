@@ -1,51 +1,63 @@
 import random
+import subprocess
+import json
+from agent_interface import call_agent, PropertyEncoder
 
 # Properties players bid on
 class Property:
     def __init__(self, value):
         self.value = value
 
+    def to_dict(self):
+        return {"value": self.value}
+
 # Checks players sell properties for
 class Check:
     def __init__(self, value):
         self.value = value
 
+    def to_dict(self):
+        return {"value": self.value}
+
 # Generic player class
 class Player:
-    def __init__(self, name):
+    def __init__(self, name, agent_script):
         self.name = name
         self.money = 14
         self.properties = []
         self.checks = []
+        self.agent_script = agent_script
 
-    def make_bid(self, current_bid, available_properties, previous_bid):
-        # For now, let's make a simple random bid or stick with the previous bid
-        if self.money > current_bid:
-            if random.choice([True, False]):  # 50% chance to raise bid
-                return current_bid + 1
-            else:
-                return previous_bid
-        return previous_bid  # Can't raise, so stick with previous bid
-    
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "money": self.money,
+            "properties": [prop.to_dict() for prop in self.properties],
+            "checks": [check.to_dict() for check in self.checks]
+        }
+
+    def make_bid(self, current_bid, game_state, previous_bid):
+        result = call_agent(self.agent_script, "bid", game_state, self, current_bid, previous_bid)
+        return result["bid"]
+
     def choose_property_to_sell(self, available_checks):
-        # Simple AI: Choose the property that best matches the relative position of the best available check
         if not self.properties:
-            raise ValueError(f"{self.name} has no properties to sell!")
-        
-        best_check_value = max(check.value for check in available_checks)
-        worst_check_value = min(check.value for check in available_checks)
-        check_range = best_check_value - worst_check_value
+            print(f"Warning: {self.name} has no properties to sell!")
+            return None
 
-        best_property_value = max(prop.value for prop in self.properties)
-        worst_property_value = min(prop.value for prop in self.properties)
-        property_range = best_property_value - worst_property_value
-
-        if property_range == 0:  # All properties have the same value
-            return self.properties[0]
-
-        target_value = worst_property_value + (property_range * (best_check_value - worst_check_value) / check_range)
-        
-        return min(self.properties, key=lambda p: abs(p.value - target_value))
+        temp_game_state = GameState(available_checks, {}, [], [self])
+        try:
+            result = call_agent(self.agent_script, "sell", temp_game_state, self)
+            property_value = result["property_to_sell"]
+            chosen_property = next((p for p in self.properties if p.value == property_value), None)
+            if chosen_property is None:
+                print(f"Warning: {self.name} chose an invalid property to sell. Choosing randomly.")
+                chosen_property = random.choice(self.properties)
+            return chosen_property
+        except Exception as e:
+            print(f"Error in choose_property_to_sell for {self.name}: {e}")
+            # Fallback: return a random property
+            return random.choice(self.properties) if self.properties else None
     
 class GameState:
     def __init__(self, available_properties, player_bids, passed_players, players):
@@ -54,10 +66,18 @@ class GameState:
         self.passed_players = passed_players
         self.players = players
 
+    def to_dict(self):
+        return {
+            "available_properties": [prop.to_dict() for prop in self.available_properties],
+            "player_bids": {player.name: bid for player, bid in self.player_bids.items()},
+            "passed_players": [player.name for player in self.passed_players],
+            "players": [player.to_dict() for player in self.players]
+        }
+
 # Initialize game state
 class ForSaleGame:
-    def __init__(self, num_players, get_back_half_rounded_up):
-        self.players = [Player(f"Player {i+1}") for i in range(num_players)]
+    def __init__(self, players, get_back_half_rounded_up):
+        self.players = players
         self.get_back_half_rounded_up = get_back_half_rounded_up
         self.current_player = 0
 
@@ -74,36 +94,37 @@ class ForSaleGame:
     # Players buy properties
     def buying_phase(self):
         round_num = 1
+        
         while len(self.property_deck) >= len(self.players):
 
             # Debugging step
-            # self.print_game_state(round_num)
+            self.print_game_state()
             
             # Reveal properties
             available_properties = [self.property_deck.pop() for _ in range(len(self.players))]
             available_properties.sort(key=lambda x: x.value)
 
-            # Initialize auction
-            highest_bidder = None
+
+            highest_bidder = self.players[(self.current_player - 1) % len(self.players)]
             current_bid = 0
             passed_players = []
             player_bids = {player: 0 for player in self.players}
 
             while len(passed_players) < len(self.players) - 1:
-                # Debugging step
-                # self.print_game_state(round_num)
                 player = self.players[self.current_player]
                 if player not in passed_players:
-                    # Copy current game state
                     game_state = GameState(
                         available_properties.copy(),
-                        player_bids.copy(),
+                        player_bids,
                         passed_players.copy(),
                         self.players
                     )
-
-                    # Get player's bid - passing should use previous bid from same player
-                    player_bid = player.make_bid(current_bid, game_state, player_bids[player])
+                    try:
+                        player_bid = player.make_bid(current_bid, game_state, player_bids[player])
+                    except Exception as e:
+                        print("Error in make_bid:")
+                        print(json.dumps(game_state.__dict__, cls=PropertyEncoder, indent=2))
+                        raise e
 
                     if player_bid > current_bid:
                         current_bid = player_bid
@@ -161,11 +182,12 @@ class ForSaleGame:
             print(f"Checks: {[p.value for p in player.checks]}")
 
 
-def run_game(num_players, get_back_half_rounded_up):
-    game = ForSaleGame(num_players, get_back_half_rounded_up=get_back_half_rounded_up)
-    
+def run_game(player_agents, get_back_half_rounded_up):
+    players = [Player(f"Player {i+1}", agent) for i, agent in enumerate(player_agents)]
+    game = ForSaleGame(players, get_back_half_rounded_up=get_back_half_rounded_up)
+
     print("Starting the game!")
-    print(f"Number of players: {num_players}")
+    print(f"Number of players: {len(player_agents)}")
     print(f"Get back half rounded up: {get_back_half_rounded_up}")
     
     game.buying_phase()
@@ -177,15 +199,23 @@ def run_game(num_players, get_back_half_rounded_up):
 
 def main():
     random.seed(42)  # Set a seed for reproducibility
-    num_games = 1
-    num_players = 5
+    num_games = 5
+    
+    player_agents = [
+        "./random_ai.py",
+        "./random_ai.py",
+        "./random_ai.py",
+        "./random_ai.py",
+        "./random_ai.py",
+    ]
+
     get_back_half_rounded_up = False
 
     for i in range(num_games):
         print(f"\n==================")
         print(f"Running game {i+1}/{num_games}")
         print(f"==================")
-        run_game(num_players, get_back_half_rounded_up)
+        run_game(player_agents, get_back_half_rounded_up)
 
 if __name__ == "__main__":
     main()
